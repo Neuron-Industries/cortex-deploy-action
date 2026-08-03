@@ -1,0 +1,121 @@
+# cortex-deploy-action — deploy merged control logic to enrolled Cortex AICs.
+#
+# Auth is GitHub Actions OIDC — the workflow needs `permissions: id-token:
+# write` and NO stored secrets. The worker verifies the token against
+# GitHub's JWKS and takes the repo/branch/sha from VERIFIED CLAIMS; the
+# `acknowledge` input must match the worker's phrase verbatim (the per-deploy
+# warning lives in the customer's own workflow file, where reviewers see it).
+name: Deploy to Cortex controllers
+description: >-
+  Deploys this repository's merged control logic to the Cortex AICs enrolled
+  on it in the Neuron Device Manager. EXTREME CAUTION — unattended deployment
+  to physical controllers; data-orchestration fleets only.
+branding:
+  icon: upload-cloud
+  color: orange
+inputs:
+  acknowledge:
+    description: >-
+      Must be exactly: "I understand this deploys code to physical controllers
+      without on-device review". The deploy is refused without it.
+    required: true
+  audience:
+    description: OIDC audience expected by the deploy endpoint.
+    required: false
+    default: https://app.neuronindustries.com/cd
+  api-base:
+    description: The MDM base URL (on-prem MDM installs override this).
+    required: false
+    default: https://app.neuronindustries.com
+  poll-timeout-s:
+    description: How long to wait for every controller to reach a terminal state.
+    required: false
+    default: "900"
+outputs:
+  deployments:
+    description: JSON array of the created deployments with per-controller results.
+    value: ${{ steps.deploy.outputs.deployments }}
+runs:
+  using: composite
+  steps:
+    - name: Deploy
+      id: deploy
+      shell: bash
+      env:
+        ACK: ${{ inputs.acknowledge }}
+        AUDIENCE: ${{ inputs.audience }}
+        API: ${{ inputs.api-base }}
+        POLL_TIMEOUT_S: ${{ inputs.poll-timeout-s }}
+      run: |
+        set -euo pipefail
+
+        mint_token() {
+          curl -sS -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=$(printf %s "$AUDIENCE" | jq -sRr @uri)" \
+            | jq -r '.value'
+        }
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "::error title=Cortex deploy::OIDC is not available — add 'permissions: id-token: write' to the workflow."
+          exit 1
+        fi
+
+        echo "::group::Requesting deployment"
+        TOKEN="$(mint_token)"
+        BODY="$(jq -n --arg ack "$ACK" '{acknowledge: $ack}')"
+        RES="$(curl -sS -o /tmp/deploy.json -w '%{http_code}' -X POST "$API/v1/cd/deploy" \
+          -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d "$BODY")"
+        cat /tmp/deploy.json | jq . || cat /tmp/deploy.json
+        echo "::endgroup::"
+
+        if [ "$RES" != "200" ]; then
+          CODE="$(jq -r '.error // "deploy_failed"' /tmp/deploy.json 2>/dev/null || echo deploy_failed)"
+          case "$CODE" in
+            ack_required)
+              echo "::error title=Cortex deploy refused::The 'acknowledge' input must match the required sentence verbatim — see the Device Manager's Continuous deployment tab for the exact text." ;;
+            no_enrollments)
+              echo "::error title=Cortex deploy refused::No controllers are enrolled on this repository+branch in the Device Manager." ;;
+            cd_outputs_forbidden|deploy_refused)
+              echo "::error title=Cortex deploy refused::$(jq -c '.skipped // .detail // .' /tmp/deploy.json)" ;;
+            *)
+              echo "::error title=Cortex deploy failed::HTTP $RES $CODE" ;;
+          esac
+          exit 1
+        fi
+
+        WARNING="$(jq -r '.warning // ""' /tmp/deploy.json)"
+        echo "::warning title=UNATTENDED CONTROLLER DEPLOYMENT::$WARNING"
+        {
+          echo "## ⚠ Cortex continuous deployment"
+          echo ""
+          echo "> $WARNING"
+          echo ""
+          jq -r '.deployments[] | "**\(.id)** — sha `\(.sha[0:10])`" + (if .folder != "" then " (folder `\(.folder)`)" else "" end) + "\n" + ([.targets[] | "- `\(.controller_id)`: " + (if .ok then "queued" else "refused — \(.error)" end)] | join("\n"))' /tmp/deploy.json
+        } >> "$GITHUB_STEP_SUMMARY"
+        echo "deployments=$(jq -c '.deployments' /tmp/deploy.json)" >> "$GITHUB_OUTPUT"
+
+        IDS="$(jq -r '.deployments[].id' /tmp/deploy.json)"
+        DEADLINE=$(( $(date +%s) + POLL_TIMEOUT_S ))
+        FAILED=0
+        for ID in $IDS; do
+          echo "::group::Waiting on $ID"
+          while :; do
+            TOKEN="$(mint_token)"   # OIDC tokens are short-lived; mint per poll
+            ST="$(curl -sS "$API/v1/cd/deployments/$ID" -H "Authorization: Bearer $TOKEN")"
+            echo "$ST" | jq -c '[.directives[] | {controller: .controller_id, status}]'
+            if [ "$(echo "$ST" | jq -r '.terminal')" = "true" ]; then
+              if [ "$(echo "$ST" | jq -r '.ok')" != "true" ]; then
+                FAILED=1
+                echo "$ST" | jq -r '.directives[] | select(.status != "done") | "::error title=Controller did not apply::\(.controller_id): \(.status) \(.detail // "")"'
+              fi
+              break
+            fi
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              FAILED=1
+              echo "::error title=Cortex deploy timeout::$ID did not reach a terminal state within ${POLL_TIMEOUT_S}s — check the Device Manager's Continuous deployment tab."
+              break
+            fi
+            sleep 20
+          done
+          echo "::endgroup::"
+        done
+        exit "$FAILED"
