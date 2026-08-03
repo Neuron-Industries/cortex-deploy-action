@@ -1,5 +1,10 @@
 # cortex-deploy-action — deploy merged control logic to enrolled Cortex AICs.
 #
+# ⚠ STAGED HERE pending its own public repository
+# (github.com/Neuron-Industries/cortex-deploy-action). Customers consume it as
+# `uses: neuron-industries/cortex-deploy-action@v1`; this copy is the source
+# of truth until the repo exists. See app/DESIGN-cd.md.
+#
 # Auth is GitHub Actions OIDC — the workflow needs `permissions: id-token:
 # write` and NO stored secrets. The worker verifies the token against
 # GitHub's JWKS and takes the repo/branch/sha from VERIFIED CLAIMS; the
@@ -19,6 +24,16 @@ inputs:
       Must be exactly: "I understand this deploys code to physical controllers
       without on-device review". The deploy is refused without it.
     required: true
+  acknowledge-outputs:
+    description: >-
+      ONLY for outputs-escalated sources (see the Device Manager's Continuous
+      deployment tab). Must be exactly: "I understand this code can drive
+      physical outputs and machinery with no human present". Bundles that
+      drive physical outputs are refused unless this sentence is present AND
+      every enrolled controller carries the outputs-escalated waiver. Leave
+      unset for data-orchestration fleets.
+    required: false
+    default: ""
   audience:
     description: OIDC audience expected by the deploy endpoint.
     required: false
@@ -43,6 +58,7 @@ runs:
       shell: bash
       env:
         ACK: ${{ inputs.acknowledge }}
+        ACK_OUTPUTS: ${{ inputs.acknowledge-outputs }}
         AUDIENCE: ${{ inputs.audience }}
         API: ${{ inputs.api-base }}
         POLL_TIMEOUT_S: ${{ inputs.poll-timeout-s }}
@@ -61,7 +77,8 @@ runs:
 
         echo "::group::Requesting deployment"
         TOKEN="$(mint_token)"
-        BODY="$(jq -n --arg ack "$ACK" '{acknowledge: $ack}')"
+        BODY="$(jq -n --arg ack "$ACK" --arg ack_out "${ACK_OUTPUTS:-}" \
+          '{acknowledge: $ack} + (if $ack_out != "" then {acknowledge_outputs: $ack_out} else {} end)')"
         RES="$(curl -sS -o /tmp/deploy.json -w '%{http_code}' -X POST "$API/v1/cd/deploy" \
           -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d "$BODY")"
         cat /tmp/deploy.json | jq . || cat /tmp/deploy.json
